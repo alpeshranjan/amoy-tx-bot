@@ -108,6 +108,7 @@ class RelayerTx(Base):
     starter: Mapped[bool] = mapped_column(Boolean, default=False)
     sim_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     sim_first_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     status: Mapped[str] = mapped_column(String(32))
     tx_to: Mapped[str | None] = mapped_column(String(42))
     calldata: Mapped[bytes | None] = mapped_column(LargeBinary)

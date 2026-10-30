@@ -23,6 +23,8 @@ def failed_transfer_text(reason: str) -> str:
         return "The transfer was cancelled before it was mined. Nothing was sent."
     if reason == "reverted":
         return "The transfer failed on chain. Nothing was sent."
+    if reason == "simulation":
+        return "The transfer could not be submitted. Nothing was sent."
     return reason
 
 
@@ -32,10 +34,6 @@ def paused_text() -> str:
 
 def waiting_text() -> str:
     return "The relayer is paused. This transfer is waiting."
-
-
-def simulation_failed_text() -> str:
-    return "The transfer could not be submitted. Nothing was sent."
 
 
 def confirm_text(amount: int, user: User, wallet: Wallet) -> str:

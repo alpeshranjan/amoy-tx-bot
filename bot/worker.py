@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramNotFound, TelegramRetryAfter
 from eth_account import Account
-from sqlalchemy import func, select, text
+from sqlalchemy import func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from web3.exceptions import ContractLogicError
 
@@ -20,10 +20,16 @@ from bot.config import Settings
 from bot.crypto import decrypt_key
 from bot.errors import FeeCeiling, LowPol, StartupError, UserReject
 from bot.models import RelayerBroadcast, RelayerState, RelayerTx, Transfer, User, Wallet
-from bot.present import failed_transfer_text, mined_text, simulation_failed_text, waiting_text
+from bot.present import failed_transfer_text, mined_text, waiting_text
 
 log = logging.getLogger(__name__)
 LOCK_KEY = 84218421
+
+
+def retry_delay(attempts: int) -> int:
+    """Seconds before a failed simulation is due again. Grows from 5 to 60."""
+    step = min(max(attempts, 1), 6)
+    return min(5 * (2 ** (step - 1)), 60)
 
 
 class _Retry(Exception):
@@ -117,9 +123,14 @@ class Worker:
                 await session.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": LOCK_KEY})
                 if await self._submitted_in(session):
                     return
+                now = self.clock.now()
                 row = await session.scalar(
                     select(RelayerTx)
-                    .where(RelayerTx.status == "queued", RelayerTx.nonce.is_(None))
+                    .where(
+                        RelayerTx.status == "queued",
+                        RelayerTx.nonce.is_(None),
+                        or_(RelayerTx.next_attempt_at.is_(None), RelayerTx.next_attempt_at <= now),
+                    )
                     .order_by(RelayerTx.created_at, RelayerTx.id)
                     .limit(1)
                 )
@@ -480,16 +491,17 @@ class Worker:
             row.sim_first_at = self.clock.now()
         elapsed = (self.clock.now() - row.sim_first_at).total_seconds()
         log.warning(
-            "simulation failed for %s on attempt %s after %ss (%s)",
+            "simulation failed for %s on attempt %s after %ss: %s",
             row.id,
             row.sim_attempts,
             int(elapsed),
-            type(exc).__name__,
+            revert_text(exc),
         )
         if elapsed < self.settings.sim_give_up_seconds:
+            row.next_attempt_at = self.clock.now() + timedelta(seconds=retry_delay(row.sim_attempts))
             return
         row.status = "failed"
-        await self._fail_transfer(session, row, simulation_failed_text())
+        await self._fail_transfer(session, row, "simulation")
 
     async def _deliver_unsent(self) -> None:
         async with self.sessions() as session:

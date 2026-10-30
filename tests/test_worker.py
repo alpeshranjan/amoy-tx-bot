@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import socket
 import subprocess
@@ -18,8 +19,8 @@ from bot.crypto import encrypt_key
 from bot.errors import StartupError
 from bot.identity import create_wallet, touch_user
 from bot.models import RelayerBroadcast, RelayerState, RelayerTx, Transfer, User, Wallet
-from bot.present import mined_text, simulation_failed_text, waiting_text
-from bot.worker import Worker
+from bot.present import failed_transfer_text, mined_text, waiting_text
+from bot.worker import Worker, retry_delay
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 ANVIL = os.path.expanduser("~/.foundry/bin/anvil")
@@ -767,8 +768,18 @@ async def test_a_fee_ceiling_pause_still_reports_a_transaction_that_lands(sessio
     assert inbox.messages[-1] == (11, f"Sent. {sent}")
 
 
+def test_simulation_backoff_grows_and_the_code_maps_to_user_text():
+    assert retry_delay(1) == 5
+    assert retry_delay(2) == 10
+    assert retry_delay(3) == 20
+    assert retry_delay(4) == 40
+    assert retry_delay(5) == 60
+    assert retry_delay(12) == 60
+    assert failed_transfer_text("simulation") == "The transfer could not be submitted. Nothing was sent."
+
+
 @pytest.mark.asyncio
-async def test_a_non_revert_simulation_error_fails_one_row_and_the_next_sender_runs(sessions, anvil):
+async def test_a_node_error_backs_off_one_row_and_the_next_sender_runs(sessions, anvil, caplog):
     settings = _deploy(anvil)
     settings.sim_give_up_seconds = 60
     inbox = Inbox()
@@ -781,58 +792,64 @@ async def test_a_non_revert_simulation_error_fails_one_row_and_the_next_sender_r
     await _mint_one(sessions, worker, recipient_id, anvil)
     now = datetime.now(timezone.utc)
     first_id, first_row = await _queue(sessions, sender_id, recipient_id, "tg:blocked", now)
-    _second_id, second_row = await _queue(
+    second_id, second_row = await _queue(
         sessions, recipient_id, sender_id, "tg:behind", now + timedelta(seconds=1)
     )
     original = worker.chain.estimate_gas
+    fail = {"head": True}
 
     async def boom(to, calldata):
-        raise Web3RPCError("{'code': -32603, 'message': 'Internal error'}")
+        if fail["head"]:
+            raise Web3RPCError(
+                "gas required exceeds allowance https://polygon-amoy.g.alchemy.com/v2/secret-key"
+            )
+        return await original(to, calldata)
 
     worker.clock = ManualClock()
     worker.chain.estimate_gas = boom
-    await worker.tick()
-    worker.clock.advance(59)
+    caplog.set_level(logging.WARNING)
     await worker.tick()
     async with sessions() as session:
         head = await session.get(RelayerTx, first_row)
         behind = await session.get(RelayerTx, second_row)
-        waiting = await session.get(Transfer, first_id)
-        assert head.sim_attempts == 2
+        assert head.sim_attempts == 1
         assert head.status == "queued"
-        assert head.sim_first_at is not None
-        assert waiting.status == "queued"
+        assert head.next_attempt_at is not None
+        assert head.next_attempt_at > worker.clock.now()
         assert behind.sim_attempts == 0
         assert behind.status == "queued"
-    assert inbox.messages == []
+        assert behind.next_attempt_at is None
+    assert "gas required exceeds allowance" in caplog.text
+    assert "secret-key" not in caplog.text
 
-    worker.clock.advance(1)
-    await worker.tick()
-    async with sessions() as session:
-        head = await session.get(RelayerTx, first_row)
-        behind = await session.get(RelayerTx, second_row)
-        failed = await session.get(Transfer, first_id)
-        assert head.status == "failed"
-        assert head.nonce is None
-        assert failed.status == "failed"
-        assert failed.error == simulation_failed_text()
-        assert "Internal error" not in failed.error
-        assert "-32603" not in failed.error
-        assert failed.notified_at is not None
-        assert behind.status == "queued"
-        assert behind.sim_attempts == 0
-    assert inbox.messages == [(11, simulation_failed_text())]
-
-    worker.chain.estimate_gas = original
+    fail["head"] = False
     await worker.tick()
     anvil.provider.make_request("evm_mine", [])
     await worker.tick()
     async with sessions() as session:
-        sent_row = await session.get(Transfer, _second_id)
+        head = await session.get(RelayerTx, first_row)
+        sent_row = await session.get(Transfer, second_id)
+        assert head.status == "queued"
+        assert head.sim_attempts == 1
         assert sent_row.status == "mined"
         assert sent_row.notified_at is not None
         sent = sent_row.tx_hash
-    assert inbox.messages[-1] == (12, f"Sent. {sent}")
+    assert (12, f"Sent. {sent}") in inbox.messages
+
+    fail["head"] = True
+    worker.clock.advance(60)
+    await worker.tick()
+    async with sessions() as session:
+        head = await session.get(RelayerTx, first_row)
+        failed = await session.get(Transfer, first_id)
+        assert head.status == "failed"
+        assert head.nonce is None
+        assert failed.status == "failed"
+        assert failed.error == "simulation"
+        assert "gas required" not in failed.error
+        assert "secret-key" not in failed.error
+        assert failed.notified_at is not None
+    assert inbox.messages[-1] == (11, failed_transfer_text("simulation"))
 
 
 @pytest.mark.asyncio
