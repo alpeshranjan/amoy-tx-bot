@@ -1,0 +1,1 @@
+"""Telegram testnet USDC transfers."""

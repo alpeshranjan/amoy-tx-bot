@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.env
+contracts/out/
+contracts/cache/
+contracts/lib/
+contracts/broadcast/
+deployments/*.json
+*.egg-info/
+.DS_Store
