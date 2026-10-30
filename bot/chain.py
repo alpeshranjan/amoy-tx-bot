@@ -42,17 +42,16 @@ def classify_rpc(exc: BaseException) -> str:
 
 
 def is_retryable_rpc(exc: BaseException) -> bool:
-    """A dropped connection, a timeout, or a rate limit. Other node errors are not."""
+    """A lost connection, a timeout, a rate limit, or a JSON-RPC error from the node.
+
+    A contract revert is not. The worker keeps running and tries the tick again.
+    """
     if isinstance(exc, ContractLogicError):
         return False
-    if isinstance(exc, TooManyRequests):
-        return True
-    if isinstance(exc, Web3RPCError):
-        message = str(exc).lower()
-        return "rate limit" in message or "too many requests" in message or "429" in message
     if isinstance(
         exc,
         (
+            Web3RPCError,
             OSError,
             TimeoutError,
             ProviderConnectionError,
@@ -65,6 +64,14 @@ def is_retryable_rpc(exc: BaseException) -> bool:
         return True
     module = type(exc).__module__
     return module.startswith("requests.") or module.startswith("urllib3.")
+
+
+def simulation_failure_counts(exc: BaseException) -> bool:
+    """A JSON-RPC error other than a rate limit. A dropped connection does not count."""
+    if not isinstance(exc, Web3RPCError):
+        return False
+    message = str(exc).lower()
+    return "rate limit" not in message and "too many requests" not in message and "429" not in message
 
 
 def revert_text(exc: BaseException) -> str:

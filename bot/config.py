@@ -32,7 +32,7 @@ class Settings(BaseSettings):
     permit_ttl_seconds: int = 3600
     rebroadcast_seconds: int = 15
     bump_after_seconds: int = 120
-    sim_attempt_limit: int = 5
+    sim_give_up_seconds: int = 180
     admin_telegram_id: int | None = None
 
     @field_validator("admin_telegram_id", mode="before")

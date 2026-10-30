@@ -34,6 +34,10 @@ def waiting_text() -> str:
     return "The relayer is paused. This transfer is waiting."
 
 
+def simulation_failed_text() -> str:
+    return "The transfer could not be submitted. Nothing was sent."
+
+
 def confirm_text(amount: int, user: User, wallet: Wallet) -> str:
     who = f"@{user.username}" if user.username else (user.first_name or "this person")
     lines = [f"Send {format_amount(amount)} USDC to {who} ({short_address(wallet.address)})?"]

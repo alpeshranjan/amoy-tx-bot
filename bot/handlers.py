@@ -185,6 +185,7 @@ def build_router(app: App) -> Router:
                 if chosen == message.from_user.id:
                     transfer.status = "failed"
                     transfer.error = "self-transfer"
+                    transfer.notified_at = _now()
                     await message.answer("You can't pay yourself.", reply_markup=ReplyKeyboardRemove())
                     return
                 recipient = await session.scalar(select(User).where(User.telegram_id == chosen))
@@ -192,6 +193,7 @@ def build_router(app: App) -> Router:
                 if recipient is None or recipient_wallet is None:
                     transfer.status = "failed"
                     transfer.error = "recipient has not started"
+                    transfer.notified_at = _now()
                     await message.answer("They need to open this bot and send /start.", reply_markup=ReplyKeyboardRemove())
                     return
                 transfer.recipient_id = recipient.id

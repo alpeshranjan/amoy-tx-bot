@@ -18,7 +18,7 @@ from bot.crypto import encrypt_key
 from bot.errors import StartupError
 from bot.identity import create_wallet, touch_user
 from bot.models import RelayerBroadcast, RelayerState, RelayerTx, Transfer, User, Wallet
-from bot.present import mined_text, waiting_text
+from bot.present import mined_text, simulation_failed_text, waiting_text
 from bot.worker import Worker
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -554,6 +554,7 @@ async def test_simulation_connection_error_leaves_the_transfer_queued(sessions, 
         assert row.status == "queued"
         assert row.nonce is None
         assert row.sim_attempts == 0
+        assert row.sim_first_at is None
 
 
 async def _queue(sessions, sender_id, recipient_id, key: str, when: datetime | None = None):
@@ -769,7 +770,7 @@ async def test_a_fee_ceiling_pause_still_reports_a_transaction_that_lands(sessio
 @pytest.mark.asyncio
 async def test_a_non_revert_simulation_error_fails_one_row_and_the_next_sender_runs(sessions, anvil):
     settings = _deploy(anvil)
-    settings.sim_attempt_limit = 2
+    settings.sim_give_up_seconds = 60
     inbox = Inbox()
     worker = _worker(sessions, settings, inbox)
     async with sessions() as session:
@@ -786,17 +787,26 @@ async def test_a_non_revert_simulation_error_fails_one_row_and_the_next_sender_r
     original = worker.chain.estimate_gas
 
     async def boom(to, calldata):
-        raise Web3RPCError("gas required exceeds allowance")
+        raise Web3RPCError("{'code': -32603, 'message': 'Internal error'}")
 
+    worker.clock = ManualClock()
     worker.chain.estimate_gas = boom
+    await worker.tick()
+    worker.clock.advance(59)
     await worker.tick()
     async with sessions() as session:
         head = await session.get(RelayerTx, first_row)
         behind = await session.get(RelayerTx, second_row)
-        assert head.sim_attempts == 1
+        waiting = await session.get(Transfer, first_id)
+        assert head.sim_attempts == 2
         assert head.status == "queued"
+        assert head.sim_first_at is not None
+        assert waiting.status == "queued"
         assert behind.sim_attempts == 0
         assert behind.status == "queued"
+    assert inbox.messages == []
+
+    worker.clock.advance(1)
     await worker.tick()
     async with sessions() as session:
         head = await session.get(RelayerTx, first_row)
@@ -805,11 +815,13 @@ async def test_a_non_revert_simulation_error_fails_one_row_and_the_next_sender_r
         assert head.status == "failed"
         assert head.nonce is None
         assert failed.status == "failed"
-        assert failed.error == "gas required exceeds allowance"
+        assert failed.error == simulation_failed_text()
+        assert "Internal error" not in failed.error
+        assert "-32603" not in failed.error
         assert failed.notified_at is not None
         assert behind.status == "queued"
         assert behind.sim_attempts == 0
-    assert inbox.messages[-1] == (11, "gas required exceeds allowance")
+    assert inbox.messages == [(11, simulation_failed_text())]
 
     worker.chain.estimate_gas = original
     await worker.tick()
@@ -821,3 +833,154 @@ async def test_a_non_revert_simulation_error_fails_one_row_and_the_next_sender_r
         assert sent_row.notified_at is not None
         sent = sent_row.tx_hash
     assert inbox.messages[-1] == (12, f"Sent. {sent}")
+
+
+@pytest.mark.asyncio
+async def test_a_json_rpc_error_during_reconcile_does_not_stop_the_worker(sessions):
+    class Header:
+        async def transaction_count(self):
+            raise Web3RPCError("header not found")
+
+    tx_hash = "0x" + "ef" * 32
+    inbox = Inbox()
+    async with sessions() as session:
+        async with session.begin():
+            user = User(telegram_id=11, username="ada")
+            session.add(user)
+            await session.flush()
+            transfer = Transfer(
+                idempotency_key="tg:header",
+                sender_id=user.id,
+                amount=1,
+                status="mined",
+                tx_hash=tx_hash,
+                expires_at=datetime.now(timezone.utc) + timedelta(minutes=10),
+            )
+            session.add(transfer)
+    worker = Worker(sessions, Header(), _settings(), bot=inbox)
+    await worker.tick()
+    assert worker.paused is False
+    assert inbox.messages == [(11, f"Sent. {tx_hash}")]
+
+
+def _telegram_method(chat_id: int):
+    from aiogram.methods import SendMessage
+
+    return SendMessage(chat_id=chat_id, text="x")
+
+
+@pytest.mark.asyncio
+async def test_a_blocked_chat_is_not_retried(sessions):
+    from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+
+    class Blocked:
+        def __init__(self, exc: Exception) -> None:
+            self.exc = exc
+            self.calls = 0
+
+        async def send_message(self, chat_id: int, text: str) -> None:
+            self.calls += 1
+            raise self.exc
+
+    async def finished(bot: Blocked, key: str, tx_hash: str) -> None:
+        async with sessions() as session:
+            async with session.begin():
+                user = await session.scalar(select(User).where(User.telegram_id == 11))
+                if user is None:
+                    user = User(telegram_id=11, username="ada")
+                    session.add(user)
+                    await session.flush()
+                transfer = Transfer(
+                    idempotency_key=key,
+                    sender_id=user.id,
+                    amount=1,
+                    status="mined",
+                    tx_hash=tx_hash,
+                    expires_at=datetime.now(timezone.utc) + timedelta(minutes=10),
+                )
+                session.add(transfer)
+                await session.flush()
+                transfer_id = transfer.id
+        worker = Worker(sessions, Count(0), _settings(), bot=bot)
+        await worker.tick()
+        await worker.tick()
+        async with sessions() as session:
+            transfer = await session.get(Transfer, transfer_id)
+            assert transfer.notified_at is not None
+        assert bot.calls == 1
+
+    await finished(
+        Blocked(
+            TelegramForbiddenError(
+                method=_telegram_method(11),
+                message="Forbidden: bot was blocked by the user",
+            )
+        ),
+        "tg:blocked",
+        "0x" + "11" * 32,
+    )
+    await finished(
+        Blocked(
+            TelegramBadRequest(
+                method=_telegram_method(11),
+                message="Bad Request: chat not found",
+            )
+        ),
+        "tg:missing-chat",
+        "0x" + "22" * 32,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_rate_limit_waits_for_retry_after(sessions):
+    from aiogram.exceptions import TelegramRetryAfter
+
+    class Limited:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def send_message(self, chat_id: int, text: str) -> None:
+            self.calls += 1
+            if self.calls == 1:
+                raise TelegramRetryAfter(
+                    method=_telegram_method(chat_id),
+                    message="Too Many Requests: retry after 30",
+                    retry_after=30,
+                )
+
+    tx_hash = "0x" + "ab" * 32
+    bot = Limited()
+    clock = ManualClock()
+    async with sessions() as session:
+        async with session.begin():
+            user = User(telegram_id=11, username="ada")
+            session.add(user)
+            await session.flush()
+            transfer = Transfer(
+                idempotency_key="tg:429",
+                sender_id=user.id,
+                amount=1,
+                status="mined",
+                tx_hash=tx_hash,
+                expires_at=datetime.now(timezone.utc) + timedelta(minutes=10),
+            )
+            session.add(transfer)
+            await session.flush()
+            transfer_id = transfer.id
+    worker = Worker(sessions, Count(0), _settings(), clock=clock, bot=bot)
+    await worker.tick()
+    await worker.tick()
+    clock.advance(29)
+    await worker.tick()
+    async with sessions() as session:
+        transfer = await session.get(Transfer, transfer_id)
+        assert transfer.notified_at is None
+    assert bot.calls == 1
+    clock.advance(1)
+    await worker.tick()
+    async with sessions() as session:
+        transfer = await session.get(Transfer, transfer_id)
+        assert transfer.notified_at is not None
+    assert bot.calls == 2
+    await worker.tick()
+    assert bot.calls == 2

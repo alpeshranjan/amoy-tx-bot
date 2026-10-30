@@ -1,18 +1,26 @@
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramNotFound, TelegramRetryAfter
 from eth_account import Account
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from web3.exceptions import ContractLogicError
 
-from bot.chain import Chain, SignedRaw, classify_rpc, is_retryable_rpc, revert_text
+from bot.chain import (
+    Chain,
+    SignedRaw,
+    classify_rpc,
+    is_retryable_rpc,
+    revert_text,
+    simulation_failure_counts,
+)
 from bot.config import Settings
 from bot.crypto import decrypt_key
 from bot.errors import FeeCeiling, LowPol, StartupError, UserReject
 from bot.models import RelayerBroadcast, RelayerState, RelayerTx, Transfer, User, Wallet
-from bot.present import failed_transfer_text, mined_text, waiting_text
+from bot.present import failed_transfer_text, mined_text, simulation_failed_text, waiting_text
 
 log = logging.getLogger(__name__)
 LOCK_KEY = 84218421
@@ -43,6 +51,7 @@ class Worker:
         self.bot = bot
         self.paused = False
         self.pause_reason: str | None = None
+        self._retry_not_before: dict[int, datetime] = {}
 
     async def startup(self) -> None:
         await self.chain.assert_boot()
@@ -134,7 +143,7 @@ class Worker:
                     await self._pause(session, row, str(exc))
                     return
                 except Exception as exc:
-                    if is_retryable_rpc(exc):
+                    if is_retryable_rpc(exc) and not simulation_failure_counts(exc):
                         raise _Retry() from exc
                     await self._note_simulation_failure(session, row, exc)
                     return
@@ -467,16 +476,20 @@ class Worker:
 
     async def _note_simulation_failure(self, session: AsyncSession, row: RelayerTx, exc: BaseException) -> None:
         row.sim_attempts = int(row.sim_attempts or 0) + 1
+        if row.sim_first_at is None:
+            row.sim_first_at = self.clock.now()
+        elapsed = (self.clock.now() - row.sim_first_at).total_seconds()
         log.warning(
-            "simulation failed for %s on attempt %s (%s)",
+            "simulation failed for %s on attempt %s after %ss (%s)",
             row.id,
             row.sim_attempts,
+            int(elapsed),
             type(exc).__name__,
         )
-        if row.sim_attempts < self.settings.sim_attempt_limit:
+        if elapsed < self.settings.sim_give_up_seconds:
             return
         row.status = "failed"
-        await self._fail_transfer(session, row, revert_text(exc))
+        await self._fail_transfer(session, row, simulation_failed_text())
 
     async def _deliver_unsent(self) -> None:
         async with self.sessions() as session:
@@ -498,8 +511,12 @@ class Worker:
                     text = failed_transfer_text(transfer.error or "The transfer failed.")
                 pending.append((transfer.id, int(user.telegram_id), text))
         for transfer_id, chat_id, text in pending:
+            not_before = self._retry_not_before.get(chat_id)
+            if not_before is not None and self.clock.now() < not_before:
+                continue
             if not await self._notify(chat_id, text):
                 continue
+            self._retry_not_before.pop(chat_id, None)
             async with self.sessions() as session:
                 transfer = await session.get(Transfer, transfer_id)
                 if transfer is not None and transfer.notified_at is None:
@@ -507,10 +524,25 @@ class Worker:
                     await session.commit()
 
     async def _notify(self, telegram_id: int | None, text: str) -> bool:
+        """Send one message. True means the row is done: Telegram accepted it, or never will."""
         if self.bot is None or telegram_id is None:
             return False
         try:
             await self.bot.send_message(telegram_id, text)
+        except TelegramRetryAfter as exc:
+            delay = max(int(exc.retry_after), 1)
+            self._retry_not_before[telegram_id] = self.clock.now() + timedelta(seconds=delay)
+            log.warning("telegram asked to retry chat %s after %s seconds", telegram_id, delay)
+            return False
+        except (TelegramForbiddenError, TelegramNotFound):
+            log.warning("telegram will not accept messages for chat %s", telegram_id)
+            return True
+        except TelegramBadRequest as exc:
+            if "chat not found" in str(exc).lower():
+                log.warning("telegram chat %s was not found", telegram_id)
+                return True
+            log.exception("could not message telegram id %s", telegram_id)
+            return False
         except Exception:
             log.exception("could not message telegram id %s", telegram_id)
             return False

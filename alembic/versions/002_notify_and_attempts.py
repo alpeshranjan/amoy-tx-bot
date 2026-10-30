@@ -18,6 +18,11 @@ def upgrade() -> None:
         "relayer_txs",
         sa.Column("sim_attempts", sa.Integer(), nullable=False, server_default="0"),
     )
+    # Rows finished before this column existed are already known to the sender.
+    op.execute(
+        "UPDATE transfers SET notified_at = CURRENT_TIMESTAMP "
+        "WHERE notified_at IS NULL AND status IN ('mined', 'failed')"
+    )
 
 
 def downgrade() -> None:

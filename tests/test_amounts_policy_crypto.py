@@ -5,7 +5,13 @@ import pytest
 import requests
 
 from bot.amounts import parse_amount
-from bot.chain import classify_rpc, is_retryable_rpc, revert_text, starting_priority_fee
+from bot.chain import (
+    classify_rpc,
+    is_retryable_rpc,
+    revert_text,
+    simulation_failure_counts,
+    starting_priority_fee,
+)
 from bot.crypto import decrypt_key, encrypt_key
 from bot.parser import fallback_intent
 from bot.policy import EntityRef, Intent, PolicyError, decide_send, precheck_text
@@ -119,11 +125,27 @@ def test_revert_text_drops_rpc_urls():
 def test_connection_errors_are_retried_and_reverts_are_not():
     from web3.exceptions import ContractLogicError, TooManyRequests, Web3RPCError
 
-    assert is_retryable_rpc(requests.exceptions.ConnectionError("https://example.invalid/v2/secret"))
+    connection = requests.exceptions.ConnectionError("https://example.invalid/v2/secret")
+    internal = Web3RPCError("{'code': -32603, 'message': 'Internal error'}")
+    allowance = Web3RPCError("gas required exceeds allowance")
+    missing = Web3RPCError("header not found")
+    limited = Web3RPCError("429 too many requests")
+    reverted = ContractLogicError("execution reverted")
+
+    assert is_retryable_rpc(connection)
     assert is_retryable_rpc(TooManyRequests("slow down"))
-    assert is_retryable_rpc(Web3RPCError("429 too many requests"))
-    assert is_retryable_rpc(Web3RPCError("gas required exceeds allowance")) is False
-    assert is_retryable_rpc(ContractLogicError("execution reverted")) is False
+    assert is_retryable_rpc(limited)
+    assert is_retryable_rpc(internal)
+    assert is_retryable_rpc(allowance)
+    assert is_retryable_rpc(missing)
+    assert is_retryable_rpc(reverted) is False
+
+    assert simulation_failure_counts(connection) is False
+    assert simulation_failure_counts(limited) is False
+    assert simulation_failure_counts(reverted) is False
+    assert simulation_failure_counts(internal)
+    assert simulation_failure_counts(allowance)
+    assert simulation_failure_counts(missing)
 
 
 def test_rpc_error_map():
