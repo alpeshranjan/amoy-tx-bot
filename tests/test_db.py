@@ -62,7 +62,6 @@ async def test_one_starter_mint_and_one_wallet(sessions):
                 await session.flush()
 
 
-@pytest.mark.asyncio
 class _Count:
     def __init__(self, value: int) -> None:
         self.value = value
@@ -71,6 +70,7 @@ class _Count:
         return self.value
 
 
+@pytest.mark.asyncio
 async def test_base_nonce_is_one_time(sessions):
     await init_base_nonce(4, chain=_Count(4))
     with pytest.raises(SystemExit):
@@ -80,6 +80,7 @@ async def test_base_nonce_is_one_time(sessions):
         assert state.base_nonce == 4
 
 
+@pytest.mark.asyncio
 async def test_base_nonce_must_match_the_chain_count(sessions):
     with pytest.raises(SystemExit, match="does not match"):
         await init_base_nonce(4, chain=_Count(1))

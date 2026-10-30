@@ -117,9 +117,12 @@ def test_revert_text_drops_rpc_urls():
 
 
 def test_connection_errors_are_retried_and_reverts_are_not():
-    assert is_retryable_rpc(requests.exceptions.ConnectionError("https://example.invalid/v2/secret"))
-    from web3.exceptions import ContractLogicError
+    from web3.exceptions import ContractLogicError, TooManyRequests, Web3RPCError
 
+    assert is_retryable_rpc(requests.exceptions.ConnectionError("https://example.invalid/v2/secret"))
+    assert is_retryable_rpc(TooManyRequests("slow down"))
+    assert is_retryable_rpc(Web3RPCError("429 too many requests"))
+    assert is_retryable_rpc(Web3RPCError("gas required exceeds allowance")) is False
     assert is_retryable_rpc(ContractLogicError("execution reverted")) is False
 
 

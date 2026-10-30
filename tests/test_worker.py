@@ -10,7 +10,7 @@ import requests
 from eth_account import Account
 from sqlalchemy import select
 from web3 import Web3
-from web3.exceptions import ContractLogicError
+from web3.exceptions import ContractLogicError, Web3RPCError
 
 from bot.chain import Chain
 from bot.config import Settings
@@ -18,7 +18,7 @@ from bot.crypto import encrypt_key
 from bot.errors import StartupError
 from bot.identity import create_wallet, touch_user
 from bot.models import RelayerBroadcast, RelayerState, RelayerTx, Transfer, User, Wallet
-from bot.present import mined_text
+from bot.present import mined_text, waiting_text
 from bot.worker import Worker
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -320,7 +320,10 @@ async def test_send_notifies_the_sender_and_a_revert_does_not_store_the_rpc_url(
         assert "http" not in transfer.error
         assert row.status == "failed"
         assert row.nonce is None
-    assert any("secret-key" not in text and "http" not in text for _, text in inbox.messages)
+        assert transfer.notified_at is not None
+        assert inbox.messages[-1] == (11, transfer.error)
+        assert "secret-key" not in transfer.error
+        assert "http" not in transfer.error
 
 
 @pytest.mark.asyncio
@@ -550,3 +553,271 @@ async def test_simulation_connection_error_leaves_the_transfer_queued(sessions, 
         assert transfer.error is None
         assert row.status == "queued"
         assert row.nonce is None
+        assert row.sim_attempts == 0
+
+
+async def _queue(sessions, sender_id, recipient_id, key: str, when: datetime | None = None):
+    now = when or datetime.now(timezone.utc)
+    async with sessions() as session:
+        async with session.begin():
+            transfer = Transfer(
+                idempotency_key=key,
+                sender_id=sender_id,
+                recipient_id=recipient_id,
+                amount=1_000_000,
+                status="queued",
+                expires_at=now + timedelta(minutes=10),
+                queued_at=now,
+                created_at=now,
+            )
+            session.add(transfer)
+            await session.flush()
+            row = RelayerTx(
+                kind="transfer",
+                user_id=sender_id,
+                transfer_id=transfer.id,
+                amount=1_000_000,
+                starter=False,
+                status="queued",
+                created_at=now,
+            )
+            session.add(row)
+            await session.flush()
+            return transfer.id, row.id
+
+
+async def _mint_one(sessions, worker: Worker, sender_id, w3: Web3) -> None:
+    async with sessions() as session:
+        async with session.begin():
+            row = RelayerTx(kind="mint", user_id=sender_id, amount=5_000_000, starter=True, status="queued")
+            session.add(row)
+            await session.flush()
+            row_id = row.id
+    await worker.tick()
+    w3.provider.make_request("evm_mine", [])
+    await worker.tick()
+    async with sessions() as session:
+        row = await session.get(RelayerTx, row_id)
+        assert row.status == "mined"
+
+
+@pytest.mark.asyncio
+async def test_restart_delivers_a_result_committed_before_shutdown(sessions):
+    tx_hash = "0x" + "ab" * 32
+    inbox = Inbox()
+    async with sessions() as session:
+        async with session.begin():
+            user = User(telegram_id=11, username="ada")
+            session.add(user)
+            await session.flush()
+            transfer = Transfer(
+                idempotency_key="tg:left",
+                sender_id=user.id,
+                amount=1,
+                status="mined",
+                tx_hash=tx_hash,
+                expires_at=datetime.now(timezone.utc) + timedelta(minutes=10),
+            )
+            session.add(transfer)
+            await session.flush()
+            transfer_id = transfer.id
+    worker = Worker(sessions, Count(0), _settings(), bot=inbox)
+    await worker.tick()
+    async with sessions() as session:
+        transfer = await session.get(Transfer, transfer_id)
+        assert transfer.notified_at is not None
+    assert inbox.messages == [(11, f"Sent. {tx_hash}")]
+    await worker.tick()
+    assert inbox.messages == [(11, f"Sent. {tx_hash}")]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_send_leaves_the_result_unsent(sessions):
+    tx_hash = "0x" + "cd" * 32
+    async with sessions() as session:
+        async with session.begin():
+            user = User(telegram_id=11, username="ada")
+            session.add(user)
+            await session.flush()
+            transfer = Transfer(
+                idempotency_key="tg:unsent",
+                sender_id=user.id,
+                amount=1,
+                status="failed",
+                error="The transfer would revert.",
+                tx_hash=tx_hash,
+                expires_at=datetime.now(timezone.utc) + timedelta(minutes=10),
+            )
+            session.add(transfer)
+            await session.flush()
+            transfer_id = transfer.id
+    worker = Worker(sessions, Count(0), _settings(), bot=BoomBot())
+    await worker.tick()
+    async with sessions() as session:
+        transfer = await session.get(Transfer, transfer_id)
+        assert transfer.notified_at is None
+    inbox = Inbox()
+    worker.bot = inbox
+    await worker.tick()
+    async with sessions() as session:
+        transfer = await session.get(Transfer, transfer_id)
+        assert transfer.notified_at is not None
+    assert inbox.messages == [(11, "The transfer would revert.")]
+
+
+@pytest.mark.asyncio
+async def test_a_mined_transfer_is_still_delivered_when_the_next_simulation_drops(sessions, anvil):
+    settings = _deploy(anvil)
+    inbox = Inbox()
+    worker = _worker(sessions, settings, inbox)
+    async with sessions() as session:
+        async with session.begin():
+            sender, recipient = await _pair(session, settings)
+            sender_id, recipient_id = sender.id, recipient.id
+    await _mint_one(sessions, worker, sender_id, anvil)
+    await _mint_one(sessions, worker, recipient_id, anvil)
+    first_id, _first_row = await _queue(sessions, sender_id, recipient_id, "tg:first")
+    await worker.tick()
+    anvil.provider.make_request("evm_mine", [])
+
+    async def down(to, calldata):
+        raise requests.exceptions.ConnectionError("https://polygon-amoy.g.alchemy.com/v2/secret-key")
+
+    worker.chain.estimate_gas = down
+    _second_id, second_row = await _queue(sessions, recipient_id, sender_id, "tg:second")
+    await worker.tick()
+    async with sessions() as session:
+        first = await session.get(Transfer, first_id)
+        second = await session.get(Transfer, _second_id)
+        row = await session.get(RelayerTx, second_row)
+        assert first.status == "mined"
+        assert first.notified_at is not None
+        sent = first.tx_hash
+        assert second.status == "queued"
+        assert row.status == "queued"
+        assert row.sim_attempts == 0
+        assert row.nonce is None
+    assert (11, f"Sent. {sent}") in inbox.messages
+
+
+@pytest.mark.asyncio
+async def test_a_low_pol_pause_says_the_transfer_is_waiting_and_then_sends(sessions, anvil):
+    settings = _deploy(anvil)
+    inbox = Inbox()
+    worker = _worker(sessions, settings, inbox)
+    async with sessions() as session:
+        async with session.begin():
+            sender, recipient = await _pair(session, settings)
+            sender_id, recipient_id = sender.id, recipient.id
+    await _mint(sessions, worker, sender_id, anvil)
+    settings.relayer_pol_threshold = 10**20
+    transfer_id, row_id = await _queue(sessions, sender_id, recipient_id, "tg:wait")
+    await worker.tick()
+    assert worker.paused is True
+    assert inbox.messages == [(11, waiting_text())]
+    async with sessions() as session:
+        transfer = await session.get(Transfer, transfer_id)
+        row = await session.get(RelayerTx, row_id)
+        assert transfer.status == "queued"
+        assert transfer.notified_at is None
+        assert row.nonce is None
+    settings.relayer_pol_threshold = 10**15
+    await worker.tick()
+    anvil.provider.make_request("evm_mine", [])
+    await worker.tick()
+    async with sessions() as session:
+        transfer = await session.get(Transfer, transfer_id)
+        assert transfer.status == "mined"
+        assert transfer.notified_at is not None
+        sent = transfer.tx_hash
+    assert inbox.messages[-1] == (11, f"Sent. {sent}")
+    assert worker.paused is False
+
+
+@pytest.mark.asyncio
+async def test_a_fee_ceiling_pause_still_reports_a_transaction_that_lands(sessions, anvil):
+    settings = _deploy(anvil)
+    inbox = Inbox()
+    worker = _worker(sessions, settings, inbox)
+    async with sessions() as session:
+        async with session.begin():
+            sender, recipient = await _pair(session, settings)
+            sender_id, recipient_id = sender.id, recipient.id
+    await _mint(sessions, worker, sender_id, anvil)
+    settings.max_priority_fee_per_gas = 2 * 10**9
+    settings.max_fee_per_gas = 2 * 10**9
+    anvil.provider.make_request("anvil_setAutomine", [False])
+    worker.clock = ManualClock()
+    transfer_id, _row_id = await _queue(sessions, sender_id, recipient_id, "tg:ceiling")
+    await worker.tick()
+    assert worker.paused is False
+    worker.clock.advance(180)
+    await worker.tick()
+    assert worker.paused is True
+    assert inbox.messages[-1] == (11, waiting_text())
+    anvil.provider.make_request("evm_mine", [])
+    await worker.tick()
+    assert worker.paused is True
+    async with sessions() as session:
+        transfer = await session.get(Transfer, transfer_id)
+        assert transfer.status == "mined"
+        assert transfer.notified_at is not None
+        sent = transfer.tx_hash
+    assert inbox.messages[-1] == (11, f"Sent. {sent}")
+
+
+@pytest.mark.asyncio
+async def test_a_non_revert_simulation_error_fails_one_row_and_the_next_sender_runs(sessions, anvil):
+    settings = _deploy(anvil)
+    settings.sim_attempt_limit = 2
+    inbox = Inbox()
+    worker = _worker(sessions, settings, inbox)
+    async with sessions() as session:
+        async with session.begin():
+            sender, recipient = await _pair(session, settings)
+            sender_id, recipient_id = sender.id, recipient.id
+    await _mint_one(sessions, worker, sender_id, anvil)
+    await _mint_one(sessions, worker, recipient_id, anvil)
+    now = datetime.now(timezone.utc)
+    first_id, first_row = await _queue(sessions, sender_id, recipient_id, "tg:blocked", now)
+    _second_id, second_row = await _queue(
+        sessions, recipient_id, sender_id, "tg:behind", now + timedelta(seconds=1)
+    )
+    original = worker.chain.estimate_gas
+
+    async def boom(to, calldata):
+        raise Web3RPCError("gas required exceeds allowance")
+
+    worker.chain.estimate_gas = boom
+    await worker.tick()
+    async with sessions() as session:
+        head = await session.get(RelayerTx, first_row)
+        behind = await session.get(RelayerTx, second_row)
+        assert head.sim_attempts == 1
+        assert head.status == "queued"
+        assert behind.sim_attempts == 0
+        assert behind.status == "queued"
+    await worker.tick()
+    async with sessions() as session:
+        head = await session.get(RelayerTx, first_row)
+        behind = await session.get(RelayerTx, second_row)
+        failed = await session.get(Transfer, first_id)
+        assert head.status == "failed"
+        assert head.nonce is None
+        assert failed.status == "failed"
+        assert failed.error == "gas required exceeds allowance"
+        assert failed.notified_at is not None
+        assert behind.status == "queued"
+        assert behind.sim_attempts == 0
+    assert inbox.messages[-1] == (11, "gas required exceeds allowance")
+
+    worker.chain.estimate_gas = original
+    await worker.tick()
+    anvil.provider.make_request("evm_mine", [])
+    await worker.tick()
+    async with sessions() as session:
+        sent_row = await session.get(Transfer, _second_id)
+        assert sent_row.status == "mined"
+        assert sent_row.notified_at is not None
+        sent = sent_row.tx_hash
+    assert inbox.messages[-1] == (12, f"Sent. {sent}")

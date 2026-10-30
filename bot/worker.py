@@ -12,7 +12,7 @@ from bot.config import Settings
 from bot.crypto import decrypt_key
 from bot.errors import FeeCeiling, LowPol, StartupError, UserReject
 from bot.models import RelayerBroadcast, RelayerState, RelayerTx, Transfer, User, Wallet
-from bot.present import failed_transfer_text, mined_text, paused_text
+from bot.present import failed_transfer_text, mined_text, waiting_text
 
 log = logging.getLogger(__name__)
 LOCK_KEY = 84218421
@@ -43,7 +43,6 @@ class Worker:
         self.bot = bot
         self.paused = False
         self.pause_reason: str | None = None
-        self._outbound: list[tuple[int, str]] = []
 
     async def startup(self) -> None:
         await self.chain.assert_boot()
@@ -51,19 +50,21 @@ class Worker:
 
     async def tick(self, *, broadcast: bool = True) -> None:
         try:
-            if self.paused and not await self._recovered():
-                return
-            await self._tick(broadcast=broadcast)
+            if self.paused:
+                await self._recovered()
+            if self.paused:
+                await self._reconcile(startup=False)
+            else:
+                await self._tick(broadcast=broadcast)
         except StartupError:
-            self._outbound.clear()
             raise
         except Exception as exc:
-            self._outbound.clear()
             if is_retryable_rpc(exc):
                 log.warning("relayer tick will retry after %s", type(exc).__name__)
                 return
             raise
-        await self._deliver()
+        finally:
+            await self._deliver_unsent()
 
     async def _tick(self, *, broadcast: bool) -> None:
         await self._reconcile(startup=False)
@@ -97,7 +98,6 @@ class Worker:
         try:
             await self._sign_next(broadcast=broadcast)
         except _Retry:
-            self._outbound.clear()
             log.warning("simulation could not reach the node; the transfer stays queued")
 
     async def _sign_next(self, *, broadcast: bool) -> None:
@@ -126,7 +126,6 @@ class Worker:
                 except UserReject as exc:
                     row.status = "failed"
                     await self._fail_transfer(session, row, str(exc))
-                    await self._remember_sender(session, row, str(exc))
                     return
                 except LowPol as exc:
                     await self._pause(session, row, str(exc))
@@ -137,7 +136,8 @@ class Worker:
                 except Exception as exc:
                     if is_retryable_rpc(exc):
                         raise _Retry() from exc
-                    raise
+                    await self._note_simulation_failure(session, row, exc)
+                    return
                 self._store_signed(row, signed, cancel=False)
                 session.add(row)
                 if row.transfer_id is not None:
@@ -383,7 +383,6 @@ class Worker:
                 await session.scalars(select(RelayerTx).where(RelayerTx.nonce.is_not(None)).order_by(RelayerTx.nonce))
             ).all()
             committed = {row.nonce: row for row in rows if row.nonce is not None}
-            notices: list[tuple[int, str]] = []
             if committed:
                 low = min(committed)
                 if chain_nonce > low:
@@ -392,7 +391,7 @@ class Worker:
                         if row is None:
                             raise StartupError(f"Nonce {nonce} was used outside the relayer table.")
                         if row.status == "submitted":
-                            ok = await self._resolve_row(session, row, notices)
+                            ok = await self._resolve_row(session, row)
                             if not ok:
                                 if startup:
                                     raise StartupError(f"Nonce {nonce} is below the chain count and has no receipt.")
@@ -405,11 +404,8 @@ class Worker:
                     f"Base nonce {state.base_nonce} is ahead of the relayer transaction count {chain_nonce}."
                 )
             await session.commit()
-            self._outbound.extend(notices)
 
-    async def _resolve_row(
-        self, session: AsyncSession, row: RelayerTx, notices: list[tuple[int, str]]
-    ) -> bool:
+    async def _resolve_row(self, session: AsyncSession, row: RelayerTx) -> bool:
         broadcasts = (
             await session.scalars(select(RelayerBroadcast).where(RelayerBroadcast.relayer_tx_id == row.id))
         ).all()
@@ -431,12 +427,9 @@ class Worker:
                 if success:
                     transfer.status = "mined"
                     transfer.error = None
-                    text = mined_text(self.settings.chain_id, broadcast.tx_hash)
                 else:
                     transfer.status = "failed"
                     transfer.error = "cancelled" if broadcast.cancel else "reverted"
-                    text = failed_transfer_text(transfer.error)
-                await self._remember_sender(session, row, text, notices)
         return True
 
     async def _next_nonce(self, session: AsyncSession) -> int:
@@ -472,41 +465,65 @@ class Worker:
             transfer.status = "failed"
             transfer.error = reason[:500]
 
-    async def _remember_sender(
-        self,
-        session: AsyncSession,
-        row: RelayerTx,
-        text: str,
-        bucket: list[tuple[int, str]] | None = None,
-    ) -> None:
-        user_id = row.user_id
-        if row.transfer_id is not None:
-            transfer = await session.get(Transfer, row.transfer_id)
-            if transfer is not None:
-                user_id = transfer.sender_id
-        user = await session.get(User, user_id)
-        if user is None:
+    async def _note_simulation_failure(self, session: AsyncSession, row: RelayerTx, exc: BaseException) -> None:
+        row.sim_attempts = int(row.sim_attempts or 0) + 1
+        log.warning(
+            "simulation failed for %s on attempt %s (%s)",
+            row.id,
+            row.sim_attempts,
+            type(exc).__name__,
+        )
+        if row.sim_attempts < self.settings.sim_attempt_limit:
             return
-        (self._outbound if bucket is None else bucket).append((int(user.telegram_id), text))
+        row.status = "failed"
+        await self._fail_transfer(session, row, revert_text(exc))
 
-    async def _deliver(self) -> None:
-        pending = self._outbound
-        self._outbound = []
-        for chat_id, text in pending:
-            await self._notify(chat_id, text)
+    async def _deliver_unsent(self) -> None:
+        async with self.sessions() as session:
+            rows = (
+                await session.scalars(
+                    select(Transfer)
+                    .where(Transfer.status.in_(("mined", "failed")), Transfer.notified_at.is_(None))
+                    .order_by(Transfer.created_at, Transfer.id)
+                )
+            ).all()
+            pending: list[tuple[uuid.UUID, int, str]] = []
+            for transfer in rows:
+                user = await session.get(User, transfer.sender_id)
+                if user is None:
+                    continue
+                if transfer.status == "mined" and transfer.tx_hash:
+                    text = mined_text(self.settings.chain_id, transfer.tx_hash)
+                else:
+                    text = failed_transfer_text(transfer.error or "The transfer failed.")
+                pending.append((transfer.id, int(user.telegram_id), text))
+        for transfer_id, chat_id, text in pending:
+            if not await self._notify(chat_id, text):
+                continue
+            async with self.sessions() as session:
+                transfer = await session.get(Transfer, transfer_id)
+                if transfer is not None and transfer.notified_at is None:
+                    transfer.notified_at = self.clock.now()
+                    await session.commit()
 
-    async def _notify(self, telegram_id: int | None, text: str) -> None:
+    async def _notify(self, telegram_id: int | None, text: str) -> bool:
         if self.bot is None or telegram_id is None:
-            return
+            return False
         try:
             await self.bot.send_message(telegram_id, text)
         except Exception:
             log.exception("could not message telegram id %s", telegram_id)
+            return False
+        return True
 
     async def _pause(self, session: AsyncSession | None, row: RelayerTx | None, reason: str) -> None:
         self.paused = True
         self.pause_reason = reason
         log.error("relayer paused: %s", reason)
         if session is not None and row is not None and row.transfer_id is not None:
-            await self._remember_sender(session, row, paused_text())
+            transfer = await session.get(Transfer, row.transfer_id)
+            if transfer is not None:
+                user = await session.get(User, transfer.sender_id)
+                if user is not None:
+                    await self._notify(int(user.telegram_id), waiting_text())
         await self._notify(self.settings.admin_telegram_id, f"Relayer paused: {reason}")

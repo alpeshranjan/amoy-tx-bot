@@ -38,7 +38,9 @@ Every 15 seconds the latest raw transaction is rebroadcast. `already known` is s
 
 On chain 80002 the first broadcast uses the larger of `eth_maxPriorityFeePerGas` and 25 gwei. Anvil has no minimum tip, so local tests still start at 2 gwei. While the permit deadline is in the future, a transaction still unmined after 2 minutes is replaced at the same nonce. Both `maxFeePerGas` and `maxPriorityFeePerGas` rise by at least 10%, and both are stored. Bumps stop at `MAX_FEE_PER_GAS` and `MAX_PRIORITY_FEE_PER_GAS`. The permit deadline is one hour, so replacements reuse the same permit. After the deadline the worker sends the 0 POL cancel instead of bumping that calldata.
 
-When a transfer is mined, the sender gets the transaction hash, or a Polygonscan link on Amoy. A revert, a cancel, or a check that fails the intent (balance, daily cap) is also sent to that chat. A transport error is not.
+When a transfer is mined, failed, or cancelled on chain, that status is committed with `transfers.notified_at` still null. Each tick sends those rows and sets the timestamp only after Telegram accepts the message, so a later error or a restart cannot drop it. The sender gets the transaction hash, or a Polygonscan link on Amoy. A check that fails the intent (balance, daily cap) is included. A transport error is not.
+
+A connection failure, a timeout, or a rate limit leaves the row queued. Any other simulation error, including a non-revert node error such as “gas required exceeds allowance”, increments `relayer_txs.sim_attempts` and fails the row after `sim_attempt_limit`. The next transfer can then run.
 
 Node errors:
 
@@ -47,7 +49,7 @@ Node errors:
 - `replacement transaction underpriced` — a larger bump
 - `insufficient funds` — pause the worker and alert
 
-A required bump past the fee ceiling also pauses the worker. None of these drop the nonce. Low POL and insufficient funds clear on a later tick once the relayer balance is back above the threshold. A missing receipt while the process is already running is retried, because a provider can be a block behind; the same gap at startup still refuses to start. Confirm is refused while the worker is paused, and the sender is told. If the admin has never opened the bot, the pause alert is logged and the process keeps running.
+A required bump past the fee ceiling also pauses new signatures. None of these drop the nonce. The worker still reconciles while paused, so a transaction already in the mempool is reported if it lands. Low POL and insufficient funds clear on a later tick once the relayer balance is back above the threshold. The sender of a queued or submitted transfer is told that it is waiting, not that nothing was sent. A missing receipt while the process is already running is retried, because a provider can be a block behind; the same gap at startup still refuses to start. Confirm is refused while the worker is paused. If the admin has never opened the bot, the pause alert is logged and the process keeps running.
 
 A transfer is final only when the relayer’s on-chain nonce has passed its nonce. The worker then checks every stored hash at that nonce and links the one that was mined. After a replacement, the original hash can still be the one included. If the mined broadcast is a cancel, or the receipt reverted, the transfer is failed and cannot land later.
 

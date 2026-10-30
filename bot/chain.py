@@ -42,9 +42,14 @@ def classify_rpc(exc: BaseException) -> str:
 
 
 def is_retryable_rpc(exc: BaseException) -> bool:
-    """Transport and node failures. A contract revert is not one of these."""
+    """A dropped connection, a timeout, or a rate limit. Other node errors are not."""
     if isinstance(exc, ContractLogicError):
         return False
+    if isinstance(exc, TooManyRequests):
+        return True
+    if isinstance(exc, Web3RPCError):
+        message = str(exc).lower()
+        return "rate limit" in message or "too many requests" in message or "429" in message
     if isinstance(
         exc,
         (
@@ -55,7 +60,6 @@ def is_retryable_rpc(exc: BaseException) -> bool:
             TooManyRequests,
             RequestTimedOut,
             PersistentConnectionError,
-            Web3RPCError,
         ),
     ):
         return True

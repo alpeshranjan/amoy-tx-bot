@@ -105,7 +105,7 @@ createdb -h 127.0.0.1 -U pay pay_test
 foundryup   # provides ~/.foundry/bin/anvil
 ```
 
-Foundry covers the router, including a permit submitted directly to the token and a router call after the deadline. Pytest covers amount parsing, key encryption, username clearing, the one-open-transfer index, and the Anvil relayer lifecycle: crash after commit, fee bump, the original hash mining after a replacement, cancel after the deadline, and a startup refusal when a nonce has no receipt.
+Foundry covers the router, including a permit submitted directly to the token and a router call after the deadline. Pytest covers amount parsing, key encryption, username clearing, the one-open-transfer index, and the Anvil relayer lifecycle: crash after commit, a result that is still delivered after a later error in the same tick or a restart, fee bump, the original hash mining after a replacement, cancel after the deadline, a pause that keeps reconciling, a simulation error that fails one transfer instead of blocking the queue, and a startup refusal when a nonce has no receipt.
 
 ## Design
 
