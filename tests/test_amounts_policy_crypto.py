@@ -2,8 +2,10 @@ import uuid
 
 import pytest
 
+import requests
+
 from bot.amounts import parse_amount
-from bot.chain import classify_rpc
+from bot.chain import classify_rpc, is_retryable_rpc, revert_text, starting_priority_fee
 from bot.crypto import decrypt_key, encrypt_key
 from bot.parser import fallback_intent
 from bot.policy import EntityRef, Intent, PolicyError, decide_send, precheck_text
@@ -49,6 +51,24 @@ def test_invented_recipient_without_entity_opens_picker():
     assert decision.mode == "picker"
 
 
+def test_username_digits_are_not_a_second_amount():
+    assert precheck_text("send 5 USDC to @maya2") is None
+    intent = fallback_intent("send 5 USDC to @maya2")
+    decision = decide_send(
+        "send 5 USDC to @maya2",
+        intent,
+        [EntityRef("mention", "@maya2", username="maya2")],
+    )
+    assert decision.username == "maya2"
+    assert decision.amount == 5_000_000
+
+
+def test_all_is_vague_only_when_no_amount_is_present():
+    assert precheck_text("send all USDC to @maya")
+    assert precheck_text("send some USDC to @maya")
+    assert precheck_text("send 5 USDC to @maya for all the help") is None
+
+
 def test_rejects_ambiguous_sends():
     assert precheck_text("send all USDC to @maya")
     assert precheck_text("send some USDC to @maya")
@@ -76,6 +96,31 @@ def test_encryption_round_trip_and_binding():
     tampered[0] ^= 0xFF
     with pytest.raises(Exception):
         decrypt_key(key, user_id, bytes(tampered), nonce)
+
+
+def test_amoy_priority_fee_starts_at_25_gwei():
+    ceiling = 50 * 10**9
+    assert starting_priority_fee(80002, 1, ceiling) == 25 * 10**9
+    assert starting_priority_fee(80002, 30 * 10**9, ceiling) == 30 * 10**9
+    assert starting_priority_fee(31337, 30 * 10**9, ceiling) == 2 * 10**9
+    with pytest.raises(Exception):
+        starting_priority_fee(80002, 1, 10**9)
+
+
+def test_revert_text_drops_rpc_urls():
+    text = revert_text(
+        RuntimeError("execution reverted: AmountOutOfRange https://polygon-amoy.g.alchemy.com/v2/secret")
+    )
+    assert "secret" not in text
+    assert "http" not in text
+    assert "AmountOutOfRange" in text
+
+
+def test_connection_errors_are_retried_and_reverts_are_not():
+    assert is_retryable_rpc(requests.exceptions.ConnectionError("https://example.invalid/v2/secret"))
+    from web3.exceptions import ContractLogicError
+
+    assert is_retryable_rpc(ContractLogicError("execution reverted")) is False
 
 
 def test_rpc_error_map():

@@ -6,13 +6,13 @@ A message is untrusted text. The model is asked for JSON matching a fixed schema
 
 Amounts are parsed with `decimal.Decimal` from that string. The string must be a positive decimal with at most 6 places and no exponent. `5.5` is 5500000 base units. `1e2` is rejected.
 
-Before a confirm card, the bot also rejects “send all”, “some”, two amounts, two recipients, any token other than USDC, and a self-transfer. A missing token defaults to USDC.
+Before a confirm card, the bot rejects two amounts, two recipients, any token other than USDC, and a self-transfer. “All” and “some” are rejected only when the message has no amount. Digits inside an @username are not counted as amounts. A missing token defaults to USDC.
 
 The model’s recipient is accepted only when it matches a `mention` or a `text_mention` in that message. A name the model invented does not select a wallet. If there is an amount and neither entity, the bot inserts the transfer as `awaiting_recipient` and shows a `request_users` button. The 32-bit `request_id` is stored on that row, and the shared user id is applied only to that row.
 
 Card-creation checks are advisory. Expiry and the hourly transfer limit are enforced when the handler moves `pending` to `queued`. The per-minute parse limit is an in-memory window on the single process.
 
-The worker re-checks the on-chain 100 USDC cap, the sender’s USDC balance, the day’s submitted and mined total plus this amount (500 USDC), and the relayer’s POL. It then `eth_call`s the exact transaction. A revert fails the intent and does not allocate a nonce.
+The worker re-checks the on-chain 100 USDC cap, the sender’s USDC balance, the day’s submitted and mined total plus this amount (500 USDC), and the relayer’s POL. It then `eth_call`s the exact transaction. A contract revert fails the intent and does not allocate a nonce. A timeout or connection error leaves the row queued and is retried. The stored error is the revert reason, never the RPC URL.
 
 ## Keys
 
@@ -20,7 +20,7 @@ Each Telegram user has one wallet. `wallets.user_id` is unique. The first `/star
 
 The private key is encrypted with AES-256-GCM under `KEY_ENCRYPTION_KEY`. Each wallet has its own nonce. The user id is the associated data, so a ciphertext cannot be moved to another row. The key is decrypted only to sign a permit, then dropped. Losing `KEY_ENCRYPTION_KEY` makes those keys unreadable. There is no second copy.
 
-The relayer key pays gas and holds `MINTER_ROLE`. It is the only bot-held key that needs POL. The deployer key is used by `forge script` and owns the router. The running bot does not have it.
+The relayer key pays gas and holds `MINTER_ROLE`. It is the only bot-held key that needs POL. The deployer key is used by `forge script` and owns the router. The running bot does not have it, and the Compose service does not pass `DEPLOYER_PRIVATE_KEY` into the container.
 
 At startup the process checks the chain id (80002 or 31337), `router.relayer()`, `router.token()`, and the relayer’s minter role.
 
@@ -30,13 +30,15 @@ User wallets are not funded with POL. Faucet POL is scarce, and a drip per walle
 
 `relayer_txs.kind` is `transfer` or `mint`. A cancel is not a new nonce. It is another `relayer_broadcasts` row at the same nonce with `cancel` set, sending 0 POL from the relayer to itself.
 
-The next nonce is the highest committed nonce plus one, or `base_nonce` on an empty table. `base_nonce` is set by `python -m bot init-base-nonce` and cannot be changed.
+The next nonce is the highest committed nonce plus one, or `base_nonce` on an empty table. `base_nonce` is set once, while the table is empty, by `python -m bot init-base-nonce <n>`. The command reads `eth_getTransactionCount` and accepts `n` only when it is exactly that count. Startup refuses if the stored base nonce is ahead of the chain or the chain has moved past it with no recorded transaction.
 
 The worker signs, `eth_call`s, and commits the hash, nonce, both fees, and raw transaction before `send_raw_transaction`. A crash after that commit rebroadcasts the same bytes. The same nonce can land once.
 
 Every 15 seconds the latest raw transaction is rebroadcast. `already known` is success. There is no mempool present-or-missing branch.
 
-While the permit deadline is in the future, a transaction still unmined after 2 minutes is replaced at the same nonce. Both `maxFeePerGas` and `maxPriorityFeePerGas` rise by at least 10%, and both are stored. Bumps stop at `MAX_FEE_PER_GAS` and `MAX_PRIORITY_FEE_PER_GAS`. The permit deadline is one hour, so replacements reuse the same permit. After the deadline the worker sends the 0 POL cancel instead of bumping that calldata.
+On chain 80002 the first broadcast uses the larger of `eth_maxPriorityFeePerGas` and 25 gwei. Anvil has no minimum tip, so local tests still start at 2 gwei. While the permit deadline is in the future, a transaction still unmined after 2 minutes is replaced at the same nonce. Both `maxFeePerGas` and `maxPriorityFeePerGas` rise by at least 10%, and both are stored. Bumps stop at `MAX_FEE_PER_GAS` and `MAX_PRIORITY_FEE_PER_GAS`. The permit deadline is one hour, so replacements reuse the same permit. After the deadline the worker sends the 0 POL cancel instead of bumping that calldata.
+
+When a transfer is mined, the sender gets the transaction hash, or a Polygonscan link on Amoy. A revert, a cancel, or a check that fails the intent (balance, daily cap) is also sent to that chat. A transport error is not.
 
 Node errors:
 
@@ -45,7 +47,7 @@ Node errors:
 - `replacement transaction underpriced` — a larger bump
 - `insufficient funds` — pause the worker and alert
 
-A required bump past the fee ceiling also pauses the worker. None of these drop the nonce.
+A required bump past the fee ceiling also pauses the worker. None of these drop the nonce. Low POL and insufficient funds clear on a later tick once the relayer balance is back above the threshold. A missing receipt while the process is already running is retried, because a provider can be a block behind; the same gap at startup still refuses to start. Confirm is refused while the worker is paused, and the sender is told. If the admin has never opened the bot, the pause alert is logged and the process keeps running.
 
 A transfer is final only when the relayer’s on-chain nonce has passed its nonce. The worker then checks every stored hash at that nonce and links the one that was mined. After a replacement, the original hash can still be the one included. If the mined broadcast is a cancel, or the receipt reverted, the transfer is failed and cannot land later.
 

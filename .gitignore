@@ -9,5 +9,6 @@ contracts/cache/
 contracts/lib/
 contracts/broadcast/
 deployments/*.json
+contracts/deployments/*.json
 *.egg-info/
 .DS_Store

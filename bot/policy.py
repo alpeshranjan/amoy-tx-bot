@@ -39,9 +39,11 @@ class SendDecision:
 
 
 def precheck_text(text: str) -> str | None:
-    if _SENDISH.search(text) and _VAGUE.search(text):
+    without_mentions = _AT.sub(" ", text)
+    amounts = _NUMBER.findall(without_mentions)
+    if _SENDISH.search(text) and _VAGUE.search(text) and not amounts:
         return "Say an exact USDC amount. “All” and “some” are not accepted."
-    if len(_NUMBER.findall(text)) > 1:
+    if len(amounts) > 1:
         return "Name one amount."
     if len(_AT.findall(text)) > 1:
         return "Name one recipient."

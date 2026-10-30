@@ -25,6 +25,7 @@ contract Deploy is Script {
         vm.serializeAddress(obj, "router", address(router));
         vm.serializeAddress(obj, "relayer", relayer);
         string memory json = vm.serializeUint(obj, "maxTransfer", MAX_TRANSFER);
+        if (!vm.exists("deployments")) vm.createDir("deployments", true);
         string memory path = string.concat("deployments/", vm.toString(block.chainid), ".json");
         vm.writeJson(json, path);
         console.log("token", address(usdc));

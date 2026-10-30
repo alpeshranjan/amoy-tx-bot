@@ -56,7 +56,7 @@ def _base(w3: Web3, account: str, nonce: int) -> dict:
 @pytest.fixture
 def anvil():
     if not os.path.exists(ANVIL):
-        pytest.skip("anvil is not installed")
+        pytest.fail(f"Anvil is required at {ANVIL}. Install Foundry and run foundryup.")
     proc = subprocess.Popen(
         [ANVIL, "--port", str(PORT), "--chain-id", "31337", "--silent"],
         stdout=subprocess.DEVNULL,
@@ -116,6 +116,7 @@ async def test_chain_boots_mints_and_accepts_a_permit(anvil: Web3):
     calldata = chain.encode_mint(user.address, 5_000_000)
     gas = await chain.estimate_gas(usdc_address, calldata)
     max_fee, priority = await chain.initial_fees()
+    assert priority == 2 * 10**9
     minted = chain.sign_transaction(
         nonce=0,
         to=usdc_address,

@@ -1,4 +1,5 @@
 import asyncio
+import re
 from dataclasses import dataclass
 
 from eth_account import Account
@@ -6,11 +7,25 @@ from eth_account.messages import encode_typed_data
 from eth_utils import to_checksum_address
 from hexbytes import HexBytes
 from web3 import Web3
-from web3.exceptions import TransactionNotFound
+from web3.exceptions import (
+    ContractLogicError,
+    PersistentConnectionError,
+    ProviderConnectionError,
+    RequestTimedOut,
+    TimeExhausted,
+    TooManyRequests,
+    TransactionNotFound,
+    Web3RPCError,
+)
 
 from bot.abi import ROUTER_ABI, USDC_ABI
 from bot.config import TOKEN_NAME, TOKEN_VERSION, Settings
-from bot.errors import StartupError
+from bot.errors import FeeCeiling, StartupError
+
+AMOY_CHAIN_ID = 80002
+AMOY_MIN_PRIORITY_FEE = 25 * 10**9
+LOCAL_PRIORITY_FEE = 2 * 10**9
+_URL = re.compile(r"https?://\S+")
 
 
 def classify_rpc(exc: BaseException) -> str:
@@ -24,6 +39,45 @@ def classify_rpc(exc: BaseException) -> str:
     if "insufficient funds" in message:
         return "insufficient_funds"
     return "other"
+
+
+def is_retryable_rpc(exc: BaseException) -> bool:
+    """Transport and node failures. A contract revert is not one of these."""
+    if isinstance(exc, ContractLogicError):
+        return False
+    if isinstance(
+        exc,
+        (
+            OSError,
+            TimeoutError,
+            ProviderConnectionError,
+            TimeExhausted,
+            TooManyRequests,
+            RequestTimedOut,
+            PersistentConnectionError,
+            Web3RPCError,
+        ),
+    ):
+        return True
+    module = type(exc).__module__
+    return module.startswith("requests.") or module.startswith("urllib3.")
+
+
+def revert_text(exc: BaseException) -> str:
+    message = _URL.sub("[rpc]", str(exc)).replace("execution reverted:", "").strip(" :")
+    if not message or message.lower() == "execution reverted":
+        return "The transfer would revert."
+    return message[:300]
+
+
+def starting_priority_fee(chain_id: int, suggested: int | None, ceiling: int) -> int:
+    if chain_id == AMOY_CHAIN_ID:
+        priority = max(int(suggested or 0), AMOY_MIN_PRIORITY_FEE)
+    else:
+        priority = LOCAL_PRIORITY_FEE
+    if priority > ceiling:
+        raise FeeCeiling("Starting priority fee is above MAX_PRIORITY_FEE_PER_GAS.")
+    return priority
 
 
 @dataclass(frozen=True)
@@ -154,7 +208,12 @@ class Chain:
         def _fees() -> tuple[int, int]:
             block = self.w3.eth.get_block("latest")
             base = int(block.get("baseFeePerGas") or self.w3.eth.gas_price or 1)
-            priority = min(2 * 10**9, self.settings.max_priority_fee_per_gas)
+            suggested = None
+            if self.settings.chain_id == AMOY_CHAIN_ID:
+                suggested = int(self.w3.eth.max_priority_fee)
+            priority = starting_priority_fee(
+                self.settings.chain_id, suggested, self.settings.max_priority_fee_per_gas
+            )
             max_fee = min(base * 2 + priority, self.settings.max_fee_per_gas)
             if max_fee < priority:
                 max_fee = priority

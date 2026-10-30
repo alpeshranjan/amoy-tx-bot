@@ -29,17 +29,18 @@ from bot.limits import ParseLimiter
 from bot.models import RelayerTx, Transfer, User, Wallet
 from bot.parser import parse_message
 from bot.policy import EntityRef, PolicyError, decide_send, precheck_text
-from bot.present import confirm_text, tx_link
+from bot.present import confirm_text, paused_text, tx_link
 
 log = logging.getLogger(__name__)
 
 
 class App:
-    def __init__(self, sessions, chain: Chain, settings: Settings, limiter: ParseLimiter) -> None:
+    def __init__(self, sessions, chain: Chain, settings: Settings, limiter: ParseLimiter, worker=None) -> None:
         self.sessions = sessions
         self.chain = chain
         self.settings = settings
         self.limiter = limiter
+        self.worker = worker
 
 
 def build_router(app: App) -> Router:
@@ -327,6 +328,11 @@ def build_router(app: App) -> Router:
                     if transfer.expires_at <= _now():
                         transfer.status = "expired"
                         await query.answer("Expired. Send it again.")
+                        return
+                    if app.worker is not None and app.worker.paused:
+                        await query.answer("Relayer is paused.")
+                        if query.message is not None:
+                            await query.message.answer(paused_text())
                         return
                     if await _hourly_full(session, db_user_id, app.settings.hourly_transfer_limit):
                         await query.answer("Hourly transfer limit reached.")

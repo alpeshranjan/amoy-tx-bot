@@ -34,6 +34,13 @@ class Settings(BaseSettings):
     bump_after_seconds: int = 120
     admin_telegram_id: int | None = None
 
+    @field_validator("admin_telegram_id", mode="before")
+    @classmethod
+    def blank_admin(cls, value: object) -> object:
+        if value == "":
+            return None
+        return value
+
     @field_validator("chain_id")
     @classmethod
     def allowlisted(cls, value: int) -> int:

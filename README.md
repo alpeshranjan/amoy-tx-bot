@@ -31,12 +31,15 @@ Anvil is for tests. It is not the demo chain.
 
 ```bash
 cd contracts
+forge install foundry-rs/forge-std --no-commit
 forge install OpenZeppelin/openzeppelin-contracts@v5.1.0 --no-commit
 forge test
 export DEPLOYER_PRIVATE_KEY=0x...
 export RELAYER_PRIVATE_KEY=0x...
 forge script script/Deploy.s.sol --rpc-url "$RPC_URL" --broadcast
 ```
+
+`forge test` and `forge script` both need `forge-std`. The script creates `contracts/deployments/` if it is missing, then writes `deployments/<chainid>.json`.
 
 `Deploy.s.sol` deploys `MockUSDC` (6 decimals, permit, minter role) and `PaymentRouter`. The router cap is fixed at 100 USDC. The bot reads `maxTransfer()` at startup and uses that same cap. The deployer key is the contract owner and is not given to the running bot.
 
@@ -50,7 +53,7 @@ uv run alembic upgrade head
 uv run python -m bot init-base-nonce <current-relayer-transaction-count>
 ```
 
-`init-base-nonce` can run once. The worker assigns the next nonce as the highest committed nonce plus one, or this base nonce when the table is empty. It does not take nonces from `eth_getTransactionCount`. That call is only used to notice mined transactions and to refuse to start if a nonce was used outside this table.
+`init-base-nonce` can run once, and only while the relayer table is empty. It reads the relayer's transaction count from the chain and accepts the number you pass only when the two are equal. A value ahead of the chain is rejected, so the first send cannot sit on a future nonce. After that, the worker assigns the next nonce as the highest committed nonce plus one. It does not take later nonces from `eth_getTransactionCount`. That call is only used to notice mined transactions and to refuse to start if a nonce was used outside this table.
 
 ## Run
 
@@ -64,7 +67,7 @@ Or, on a small VPS:
 docker compose up -d --build
 ```
 
-Run `init-base-nonce` before the first send. Keep a single bot replica. The worker holds the relayer nonce.
+Run `init-base-nonce` before the first send. Inside Compose that is `docker compose run --rm bot init-base-nonce <n>`. The image installs from `uv.lock`, and the service does not receive `DEPLOYER_PRIVATE_KEY`. Keep a single bot replica. The worker holds the relayer nonce.
 
 ## Talking to the bot
 
@@ -85,9 +88,9 @@ Built one at a time. A later module is not treated as done while an earlier one 
 2. Parsing, amounts, and key encryption. No chain and no database.
 3. Postgres. Users, one wallet per user, transfer intents, and the relayer nonce tables.
 4. Chain client. Boot checks, mint, balance, and an EIP-2612 permit against a fresh Anvil.
-5. Relayer worker. Nonce order, commit-before-broadcast, fee bumps, and cancels. Next.
+5. Relayer worker. Nonce order, commit-before-broadcast, fee bumps, cancels, and the sender's result message.
 6. Telegram handlers.
-7. Amoy deploy and the live bot.
+7. Amoy deploy and the live bot. Not done.
 
 ## Tests
 
@@ -95,7 +98,14 @@ Built one at a time. A later module is not treated as done while an earlier one 
 make test
 ```
 
-Foundry covers the router, including a permit submitted directly to the token and a router call after the deadline. Pytest covers amount parsing, key encryption, username clearing, the one-open-transfer index, and the Anvil relayer lifecycle: crash after commit, fee bump, the original hash mining after a replacement, cancel-after-deadline, and a startup refusal when a nonce has no receipt.
+Pytest needs Postgres on `127.0.0.1:5432` with database `pay_test`, user `pay`, password `pay`, and Anvil at `~/.foundry/bin/anvil`. Both are required. A missing Anvil fails the chain and worker tests instead of skipping them.
+
+```bash
+createdb -h 127.0.0.1 -U pay pay_test
+foundryup   # provides ~/.foundry/bin/anvil
+```
+
+Foundry covers the router, including a permit submitted directly to the token and a router call after the deadline. Pytest covers amount parsing, key encryption, username clearing, the one-open-transfer index, and the Anvil relayer lifecycle: crash after commit, fee bump, the original hash mining after a replacement, cancel after the deadline, and a startup refusal when a nonce has no receipt.
 
 ## Design
 
